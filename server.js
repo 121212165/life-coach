@@ -1,82 +1,68 @@
-require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const WebSocket = require('ws');
-const axios = require('axios');
-const http = require('http');
+const path = require('path');
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
 
-app.use(cors());
 app.use(express.json());
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// WebSocket连接处理
-wss.on('connection', (ws) => {
-  console.log('Client connected');
+const SYSTEM_PROMPT = '你是一位专业的Life Coach，你会通过倾听和提问来帮助我成长。你的回答应该富有洞察力，同时保持温暖和支持性。请用简单易懂的语言与我交流，并给出具体可行的建议。';
 
-  ws.on('message', async (message) => {
-    try {
-      const data = JSON.parse(message);
-      const response = await axios.post(
-        'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-        {
-          model: 'deepseek-r1-250120',
-          messages: data.messages,
-          stream: true,
-          temperature: 0.6
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.API_KEY}`
-          },
-          timeout: 60000,
-          responseType: 'stream'
+app.post('/api/chat', async (req, res) => {
+  const { messages } = req.body;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  try {
+    const response = await fetch('https://ark.cn-beijing.volces.com/api/v3/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'deepseek-r1-250120',
+        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
+        stream: true,
+        temperature: 0.6
+      })
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') {
+          res.write('data: [DONE]\n\n');
+          continue;
         }
-      );
-
-      response.data.on('data', (chunk) => {
-        const lines = chunk.toString().split('\n').filter(line => line.trim() !== '');
-        for (const line of lines) {
-          if (line.includes('data: ')) {
-            const data = line.replace('data: ', '');
-            if (data !== '[DONE]') {
-              try {
-                const parsed = JSON.parse(data);
-                const content = parsed.choices[0].delta.content;
-                if (content) {
-                  ws.send(JSON.stringify({ type: 'content', content }));
-                }
-              } catch (e) {
-                console.error('Parse error:', e);
-              }
-            }
-          }
-        }
-      });
-
-      response.data.on('end', () => {
-        ws.send(JSON.stringify({ type: 'done' }));
-      });
-
-    } catch (error) {
-      console.error('Error:', error);
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: '请求失败，请稍后重试'
-      }));
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) res.write(`data: ${JSON.stringify({ content })}\n\n`);
+        } catch {}
+      }
     }
-  });
+  } catch (err) {
+    console.error('API error:', err);
+    res.write(`data: ${JSON.stringify({ error: '请求失败，请稍后重试' })}\n\n`);
+  }
 
-  ws.on('close', () => {
-    console.log('Client disconnected');
-  });
+  res.end();
 });
 
 const PORT = process.env.PORT || 8006;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
